@@ -213,15 +213,6 @@ def looks_like_runnable_app(app_root: Path) -> bool:
     )
 
 
-def is_workspace_root(repo_root: Path) -> bool:
-    package_json = read_json_object(repo_root / "package.json") or {}
-    workspaces = package_json.get("workspaces")
-    return bool(workspaces) or any(
-        (repo_root / name).exists()
-        for name in ("pnpm-workspace.yaml", "turbo.json", "nx.json")
-    )
-
-
 def discover_app_candidates(repo_root: Path) -> list[Path]:
     manifest_names = {
         "package.json",
@@ -255,12 +246,12 @@ def resolve_app_root(
 
     candidates = discover_app_candidates(repo_root)
     if looks_like_runnable_app(repo_root):
-        if is_workspace_root(repo_root) and candidates:
+        if candidates:
             candidate_list = ", ".join(
                 [".", *(relative_path(path, repo_root) for path in candidates)]
             )
             blockers.append(
-                "A runnable workspace root and nested app candidates were found. Re-run with "
+                "A runnable repository root and nested app candidates were found. Re-run with "
                 f"--app-path set to one of: {candidate_list}."
             )
         return repo_root, ".", warnings, blockers
@@ -740,6 +731,14 @@ def apply_explicit_overrides(
     services = config.setdefault("services", {})
     web = services.setdefault("web", {})
 
+    def runtime_services():
+        for service in services.values():
+            if not isinstance(service, dict):
+                continue
+            is_pure_static = service.get("type") == "static" and service.get("command") is None
+            if not is_pure_static:
+                yield service
+
     if args.web_type:
         if args.web_type == "container":
             web.pop("type", None)
@@ -751,33 +750,31 @@ def apply_explicit_overrides(
         web["port"] = args.port
     if args.public_path:
         web["publicPath"] = args.public_path
-    if args.image or args.build_command:
-        for service in services.values():
-            if not isinstance(service, dict):
-                continue
-            is_pure_static = service.get("type") == "static" and service.get("command") is None
-            if is_pure_static:
-                continue
-            if args.image:
-                service["image"] = args.image
+    if args.image:
+        for service in runtime_services():
+            service["image"] = args.image
             if args.build_command:
                 service["build"] = args.build_command
+            else:
+                service.pop("build", None)
     if args.health_path:
         route = args.health_path if args.health_path.startswith("/") else f"/{args.health_path}"
         port = web.get("port", args.port or 8000)
         web["health"] = {"command": f"curl -f http://localhost:{port}{route} || exit 1"}
 
-    if args.dockerfile and selected_dockerfile and selected_dockerfile != repo_root / "Dockerfile":
-        config.setdefault("images", {})["app"] = {
-            "dockerfile": relative_path(selected_dockerfile, repo_root),
-            "context": relative_path(build_context or selected_dockerfile.parent, repo_root),
-        }
-        for service in services.values():
-            if not isinstance(service, dict):
-                continue
-            is_pure_static = service.get("type") == "static" and service.get("command") is None
-            if not is_pure_static:
+    if args.dockerfile and selected_dockerfile:
+        if selected_dockerfile == repo_root / "Dockerfile":
+            for service in runtime_services():
+                service.pop("image", None)
+                service.pop("build", None)
+        else:
+            config.setdefault("images", {})["app"] = {
+                "dockerfile": relative_path(selected_dockerfile, repo_root),
+                "context": relative_path(build_context or selected_dockerfile.parent, repo_root),
+            }
+            for service in runtime_services():
                 service["image"] = "app"
+                service.pop("build", None)
 
 
 def cron_expression_is_valid(expression: Any) -> bool:
@@ -1116,6 +1113,9 @@ def main() -> int:
         return 2
     if args.build_command and not args.image:
         print("[ERROR] --build-command requires --image to name the base image.")
+        return 2
+    if args.image and args.dockerfile:
+        print("[ERROR] Choose either --image or --dockerfile, not both.")
         return 2
 
     try:

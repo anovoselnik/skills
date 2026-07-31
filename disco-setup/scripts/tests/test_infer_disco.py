@@ -211,15 +211,12 @@ class DiscoAnalyzerTests(unittest.TestCase):
 
             self.assertTrue(blockers)
 
-    def test_runnable_workspace_root_with_nested_app_is_a_blocker(self) -> None:
+    def test_runnable_root_with_nested_app_is_a_blocker_without_workspace_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_json(
                 root / "package.json",
-                {
-                    "workspaces": ["apps/*"],
-                    "scripts": {"start": "node root.js"},
-                },
+                {"scripts": {"start": "node root.js"}},
             )
             self.write_json(
                 root / "apps" / "web" / "package.json",
@@ -229,7 +226,7 @@ class DiscoAnalyzerTests(unittest.TestCase):
             _, _, _, blockers = infer_disco.resolve_app_root(root, None)
 
             self.assertTrue(blockers)
-            self.assertIn("workspace root", blockers[0])
+            self.assertIn("repository root", blockers[0])
 
     def test_prebuilt_image_allows_dockerfile_free_app(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -306,8 +303,16 @@ class DiscoAnalyzerTests(unittest.TestCase):
                 {
                     "version": "1.0",
                     "services": {
-                        "web": {"port": 3000, "image": "old/web:latest"},
-                        "worker": {"command": "node worker.js", "image": "old/worker:latest"},
+                        "web": {
+                            "port": 3000,
+                            "image": "old/web:latest",
+                            "build": "npm ci",
+                        },
+                        "worker": {
+                            "command": "node worker.js",
+                            "image": "old/worker:latest",
+                            "build": "npm ci",
+                        },
                     },
                 },
             )
@@ -318,6 +323,44 @@ class DiscoAnalyzerTests(unittest.TestCase):
             services = json.loads((root / "disco.json").read_text())["services"]
             self.assertEqual(services["web"]["image"], "node:22")
             self.assertEqual(services["worker"]["image"], "node:22")
+            self.assertNotIn("build", services["web"])
+            self.assertNotIn("build", services["worker"])
+
+    def test_explicit_custom_dockerfile_removes_preserved_build_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "apps" / "web"
+            app.mkdir(parents=True)
+            (app / "Dockerfile").write_text("FROM node:22\nEXPOSE 3000\n", encoding="utf-8")
+            self.write_json(app / "package.json", {"scripts": {"start": "node server.js"}})
+            self.write_json(
+                root / "disco.json",
+                {
+                    "version": "1.0",
+                    "services": {
+                        "web": {
+                            "port": 3000,
+                            "image": "node:22",
+                            "build": "npm ci",
+                        }
+                    },
+                },
+            )
+
+            result = self.run_cli(
+                root,
+                "--app-path",
+                "apps/web",
+                "--dockerfile",
+                "apps/web/Dockerfile",
+                "--context",
+                "apps/web",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            web = json.loads((root / "disco.json").read_text())["services"]["web"]
+            self.assertEqual(web["image"], "app")
+            self.assertNotIn("build", web)
 
     def test_blocker_prevents_output_but_writes_requested_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
