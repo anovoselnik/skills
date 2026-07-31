@@ -9,7 +9,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 SKIP_DIRS = {
     ".git",
@@ -65,6 +65,12 @@ SENSITIVE_KEY_PATTERN = re.compile(
 
 class AnalysisError(Exception):
     """Raised when repository input cannot be analyzed safely."""
+
+
+class CronCandidate(NamedTuple):
+    name: str
+    command: str
+    schedule: str | None
 
 
 def safe_read_text(path: Path) -> str:
@@ -207,6 +213,15 @@ def looks_like_runnable_app(app_root: Path) -> bool:
     )
 
 
+def is_workspace_root(repo_root: Path) -> bool:
+    package_json = read_json_object(repo_root / "package.json") or {}
+    workspaces = package_json.get("workspaces")
+    return bool(workspaces) or any(
+        (repo_root / name).exists()
+        for name in ("pnpm-workspace.yaml", "turbo.json", "nx.json")
+    )
+
+
 def discover_app_candidates(repo_root: Path) -> list[Path]:
     manifest_names = {
         "package.json",
@@ -238,10 +253,18 @@ def resolve_app_root(
             raise AnalysisError(f"Application path does not exist: {app_root}")
         return app_root, relative_path(app_root, repo_root) or ".", warnings, blockers
 
+    candidates = discover_app_candidates(repo_root)
     if looks_like_runnable_app(repo_root):
+        if is_workspace_root(repo_root) and candidates:
+            candidate_list = ", ".join(
+                [".", *(relative_path(path, repo_root) for path in candidates)]
+            )
+            blockers.append(
+                "A runnable workspace root and nested app candidates were found. Re-run with "
+                f"--app-path set to one of: {candidate_list}."
+            )
         return repo_root, ".", warnings, blockers
 
-    candidates = discover_app_candidates(repo_root)
     if len(candidates) == 1:
         app_root = candidates[0]
         app_path = relative_path(app_root, repo_root)
@@ -308,6 +331,34 @@ def choose_dockerfile(
             f"belongs to this app: {candidates}."
         )
     return None, warnings, blockers
+
+
+def resolve_build_context(
+    repo_root: Path,
+    selected_dockerfile: Path | None,
+    explicit_context: str | None,
+) -> tuple[Path | None, list[str]]:
+    blockers: list[str] = []
+    if not selected_dockerfile:
+        if explicit_context:
+            raise AnalysisError("--context requires a selected Dockerfile.")
+        return None, blockers
+
+    if explicit_context:
+        context = (repo_root / explicit_context).resolve()
+        if not path_within(context, repo_root):
+            raise AnalysisError("--context must resolve inside --repo.")
+        if not context.is_dir():
+            raise AnalysisError(f"Build context does not exist: {context}")
+        return context, blockers
+
+    if selected_dockerfile == repo_root / "Dockerfile":
+        return repo_root, blockers
+
+    blockers.append(
+        "A non-root Dockerfile needs an explicit build context. Re-run with --context."
+    )
+    return selected_dockerfile.parent, blockers
 
 
 def parse_exposed_port(dockerfile_path: Path | None) -> int | None:
@@ -488,12 +539,12 @@ def infer_cron_schedule(script_name: str) -> str | None:
 def detect_cron_commands(
     scripts: dict[str, str],
     package_manager: str,
-) -> list[tuple[str, str, str | None]]:
+) -> list[CronCandidate]:
     return [
-        (
-            sanitize_service_name(name),
-            run_script_cmd(package_manager, name),
-            infer_cron_schedule(name),
+        CronCandidate(
+            name=sanitize_service_name(name),
+            command=run_script_cmd(package_manager, name),
+            schedule=infer_cron_schedule(name),
         )
         for name in sorted(scripts)
         if is_cron_script(name)
@@ -511,6 +562,26 @@ def attach_runtime_image(
         service["build"] = build_command
 
 
+def make_runtime_service(
+    *,
+    command: str,
+    runtime_image: str | None,
+    build_command: str | None,
+    volumes: list[dict[str, str]] | None,
+    service_type: str | None = None,
+    schedule: str | None = None,
+) -> dict[str, Any]:
+    service: dict[str, Any] = {"command": command}
+    if service_type:
+        service["type"] = service_type
+    if schedule:
+        service["schedule"] = schedule
+    attach_runtime_image(service, runtime_image, build_command)
+    if volumes:
+        service["volumes"] = volumes
+    return service
+
+
 def build_disco_config(
     repo_root: Path,
     app_root: Path,
@@ -519,6 +590,7 @@ def build_disco_config(
     package_json: dict[str, Any],
     framework: str,
     selected_dockerfile: Path | None,
+    build_context: Path | None,
     explicit_port: int | None,
     explicit_image: str | None = None,
     build_command: str | None = None,
@@ -548,7 +620,7 @@ def build_disco_config(
             runtime_image = "app"
             images[runtime_image] = {
                 "dockerfile": dockerfile_relative,
-                "context": relative_path(selected_dockerfile.parent, repo_root),
+                "context": relative_path(build_context or selected_dockerfile.parent, repo_root),
             }
 
     if web_type:
@@ -582,7 +654,7 @@ def build_disco_config(
         web["port"] = detected_port
         attach_runtime_image(web, runtime_image, build_command)
 
-        if not selected_dockerfile and not runtime_image and "start" in scripts:
+        if not selected_dockerfile and "start" in scripts:
             web["command"] = run_script_cmd(package_manager, "start")
 
         route = health_path or detect_health_route(app_root)
@@ -607,35 +679,39 @@ def build_disco_config(
 
     migration_command = detect_migration_command(scripts, package_manager, app_root)
     if migration_command:
-        hook: dict[str, Any] = {"type": "command", "command": migration_command}
-        attach_runtime_image(hook, runtime_image, build_command)
-        if "volumes" in web:
-            hook["volumes"] = web["volumes"]
-        services["hook:deploy:start:before"] = hook
+        services["hook:deploy:start:before"] = make_runtime_service(
+            command=migration_command,
+            runtime_image=runtime_image,
+            build_command=build_command,
+            volumes=web.get("volumes"),
+            service_type="command",
+        )
         facts["migrationCommand"] = migration_command
 
     for name, command in detect_worker_commands(app_root, scripts, package_manager).items():
-        worker: dict[str, Any] = {"command": command}
-        attach_runtime_image(worker, runtime_image, build_command)
-        if "volumes" in web:
-            worker["volumes"] = web["volumes"]
-        services[name] = worker
+        services[name] = make_runtime_service(
+            command=command,
+            runtime_image=runtime_image,
+            build_command=build_command,
+            volumes=web.get("volumes"),
+        )
 
-    for name, command, schedule in detect_cron_commands(scripts, package_manager):
-        if not schedule:
-            warnings.append(
-                f"Cron-like script '{name}' has no safe inferred schedule; add the service manually."
-            )
+    ambiguous_crons: list[str] = []
+    for candidate in detect_cron_commands(scripts, package_manager):
+        if not candidate.schedule:
+            ambiguous_crons.append(candidate.name)
             continue
-        cron: dict[str, Any] = {
-            "type": "cron",
-            "schedule": schedule,
-            "command": command,
-        }
-        attach_runtime_image(cron, runtime_image, build_command)
-        if "volumes" in web:
-            cron["volumes"] = web["volumes"]
-        services[name] = cron
+        services[candidate.name] = make_runtime_service(
+            command=candidate.command,
+            runtime_image=runtime_image,
+            build_command=build_command,
+            volumes=web.get("volumes"),
+            service_type="cron",
+            schedule=candidate.schedule,
+        )
+
+    if ambiguous_crons:
+        facts["ambiguousCronServices"] = ambiguous_crons
 
     disco: dict[str, Any] = {"version": "1.0", "services": services}
     if images:
@@ -658,6 +734,7 @@ def apply_explicit_overrides(
     config: dict[str, Any],
     args: argparse.Namespace,
     selected_dockerfile: Path | None,
+    build_context: Path | None,
     repo_root: Path,
 ) -> None:
     services = config.setdefault("services", {})
@@ -674,10 +751,17 @@ def apply_explicit_overrides(
         web["port"] = args.port
     if args.public_path:
         web["publicPath"] = args.public_path
-    if args.image:
-        web["image"] = args.image
-    if args.build_command:
-        web["build"] = args.build_command
+    if args.image or args.build_command:
+        for service in services.values():
+            if not isinstance(service, dict):
+                continue
+            is_pure_static = service.get("type") == "static" and service.get("command") is None
+            if is_pure_static:
+                continue
+            if args.image:
+                service["image"] = args.image
+            if args.build_command:
+                service["build"] = args.build_command
     if args.health_path:
         route = args.health_path if args.health_path.startswith("/") else f"/{args.health_path}"
         port = web.get("port", args.port or 8000)
@@ -686,9 +770,14 @@ def apply_explicit_overrides(
     if args.dockerfile and selected_dockerfile and selected_dockerfile != repo_root / "Dockerfile":
         config.setdefault("images", {})["app"] = {
             "dockerfile": relative_path(selected_dockerfile, repo_root),
-            "context": relative_path(selected_dockerfile.parent, repo_root),
+            "context": relative_path(build_context or selected_dockerfile.parent, repo_root),
         }
-        web["image"] = "app"
+        for service in services.values():
+            if not isinstance(service, dict):
+                continue
+            is_pure_static = service.get("type") == "static" and service.get("command") is None
+            if not is_pure_static:
+                service["image"] = "app"
 
 
 def cron_expression_is_valid(expression: Any) -> bool:
@@ -724,6 +813,89 @@ def redact_sensitive(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_sensitive(child) for child in value]
     return value
+
+
+def valid_port(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535
+
+
+def validate_service_fields(
+    service_name: str,
+    service: dict[str, Any],
+) -> list[str]:
+    blockers: list[str] = []
+
+    if "port" in service and not valid_port(service.get("port")):
+        blockers.append(f"services.{service_name}.port must be an integer from 1 to 65535.")
+    for field in ("image", "command", "build", "publicPath", "schedule"):
+        if field in service and (
+            not isinstance(service.get(field), str) or not service.get(field)
+        ):
+            blockers.append(f"services.{service_name}.{field} must be a non-empty string.")
+
+    volumes = service.get("volumes")
+    if volumes is not None:
+        if not isinstance(volumes, list):
+            blockers.append(f"services.{service_name}.volumes must be a list.")
+        else:
+            for index, volume in enumerate(volumes):
+                if not isinstance(volume, dict):
+                    blockers.append(f"services.{service_name}.volumes[{index}] must be an object.")
+                    continue
+                if not isinstance(volume.get("name"), str) or not volume.get("name"):
+                    blockers.append(f"services.{service_name}.volumes[{index}].name must be a string.")
+                if not isinstance(volume.get("destinationPath"), str) or not volume.get("destinationPath"):
+                    blockers.append(
+                        f"services.{service_name}.volumes[{index}].destinationPath must be a string."
+                    )
+
+    published_ports = service.get("publishedPorts")
+    if published_ports is not None:
+        if not isinstance(published_ports, list):
+            blockers.append(f"services.{service_name}.publishedPorts must be a list.")
+        else:
+            for index, port in enumerate(published_ports):
+                if not isinstance(port, dict):
+                    blockers.append(
+                        f"services.{service_name}.publishedPorts[{index}] must be an object."
+                    )
+                    continue
+                if not valid_port(port.get("publishedAs")):
+                    blockers.append(
+                        f"services.{service_name}.publishedPorts[{index}].publishedAs must be a valid port."
+                    )
+                if not valid_port(port.get("fromContainerPort")):
+                    blockers.append(
+                        f"services.{service_name}.publishedPorts[{index}].fromContainerPort must be a valid port."
+                    )
+                if port.get("protocol", "tcp") not in {"tcp", "udp"}:
+                    blockers.append(
+                        f"services.{service_name}.publishedPorts[{index}].protocol must be tcp or udp."
+                    )
+
+    health = service.get("health")
+    if health is not None and (
+        not isinstance(health, dict)
+        or not isinstance(health.get("command"), str)
+        or not health.get("command")
+    ):
+        blockers.append(f"services.{service_name}.health must contain a non-empty command string.")
+
+    timeout = service.get("timeout")
+    if timeout is not None and (
+        not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0
+    ):
+        blockers.append(f"services.{service_name}.timeout must be a positive integer.")
+
+    exposed_internally = service.get("exposedInternally")
+    if exposed_internally is not None and not isinstance(exposed_internally, bool):
+        blockers.append(f"services.{service_name}.exposedInternally must be a boolean.")
+
+    extra_swarm_params = service.get("extraSwarmParams")
+    if extra_swarm_params is not None and not isinstance(extra_swarm_params, str):
+        blockers.append(f"services.{service_name}.extraSwarmParams must be a string.")
+
+    return blockers
 
 
 def validate_disco_config(
@@ -778,6 +950,7 @@ def validate_disco_config(
         if not isinstance(service, dict):
             blockers.append(f"services.{service_name} must be an object.")
             continue
+        blockers.extend(validate_service_fields(str(service_name), service))
         unknown_service_fields = sorted(set(service) - SERVICE_FIELDS)
         if unknown_service_fields:
             warnings.append(
@@ -791,9 +964,8 @@ def validate_disco_config(
             continue
 
         if service_name == "web" and service_type in {"container", "cgi"}:
-            port = service.get("port")
-            if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
-                blockers.append("services.web.port must be an integer from 1 to 65535.")
+            if "port" not in service:
+                blockers.append("services.web.port is required for container and cgi services.")
         if service_type in {"static", "generator"} and not isinstance(service.get("publicPath"), str):
             blockers.append(f"services.{service_name}.publicPath is required for type {service_type}.")
         if service_type in {"command", "cron"} and not isinstance(service.get("command"), str):
@@ -902,6 +1074,7 @@ def parse_args() -> argparse.Namespace:
         help="Application path inside the repository; auto-detected when omitted",
     )
     parser.add_argument("--dockerfile", default=None, help="Dockerfile path relative to --repo")
+    parser.add_argument("--context", default=None, help="Build context path relative to --repo")
     parser.add_argument("--image", default=None, help="Prebuilt or base image for inferred services")
     parser.add_argument(
         "--build-command",
@@ -978,6 +1151,16 @@ def main() -> int:
             print(f"[ERROR] {exc}")
             return 2
 
+    try:
+        build_context, context_blockers = resolve_build_context(
+            repo_root,
+            selected_dockerfile,
+            args.context,
+        )
+    except AnalysisError as exc:
+        print(f"[ERROR] {exc}")
+        return 2
+
     inferred, metadata = build_disco_config(
         repo_root=repo_root,
         app_root=app_root,
@@ -986,6 +1169,7 @@ def main() -> int:
         package_json=package_json,
         framework=framework,
         selected_dockerfile=selected_dockerfile,
+        build_context=build_context,
         explicit_port=args.port,
         explicit_image=args.image,
         build_command=args.build_command,
@@ -1011,6 +1195,20 @@ def main() -> int:
             print(f"[ERROR] {exc} Use --force only if replacing it is intentional.")
             return 2
 
+    if context_blockers:
+        selected_relative = (
+            relative_path(selected_dockerfile, repo_root) if selected_dockerfile else None
+        )
+        existing_images = existing.get("images", {}) if existing else {}
+        existing_context_is_explicit = isinstance(existing_images, dict) and any(
+            isinstance(image, dict)
+            and image.get("dockerfile") == selected_relative
+            and isinstance(image.get("context"), str)
+            for image in existing_images.values()
+        )
+        if not existing_context_is_explicit:
+            metadata["blockers"].extend(context_blockers)
+
     if existing is not None:
         final_config = merge_missing(existing, inferred)
         metadata["facts"]["updateMode"] = "preserve-existing"
@@ -1018,7 +1216,21 @@ def main() -> int:
         final_config = inferred
         metadata["facts"]["updateMode"] = "replace" if output_path.exists() else "new"
 
-    apply_explicit_overrides(final_config, args, selected_dockerfile, repo_root)
+    apply_explicit_overrides(
+        final_config,
+        args,
+        selected_dockerfile,
+        build_context,
+        repo_root,
+    )
+    for service_name in metadata["facts"].get("ambiguousCronServices", []):
+        service = final_config.get("services", {}).get(service_name)
+        if not isinstance(service, dict) or service.get("type") != "cron" or not cron_expression_is_valid(
+            service.get("schedule")
+        ):
+            metadata["blockers"].append(
+                f"Cron-like script '{service_name}' needs an explicit cron service and schedule."
+            )
     validation_warnings, validation_blockers = validate_disco_config(final_config, repo_root)
     metadata["warnings"] = unique_messages(metadata["warnings"] + validation_warnings)
     metadata["blockers"] = unique_messages(metadata["blockers"] + validation_blockers)

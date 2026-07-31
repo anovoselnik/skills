@@ -23,7 +23,7 @@ Complete this step when the proposed configuration, every warning, and every blo
 2. Resolve every blocker using repository evidence:
 
 - Select ambiguous monorepo apps with `--app-path`.
-- Select ambiguous Dockerfiles with `--dockerfile`.
+- Select ambiguous Dockerfiles with `--dockerfile` and set the intended `--context` for non-root Dockerfiles.
 - For Dockerfile-free apps, choose either a prebuilt `--image` or a base `--image` with `--build-command`.
 - Set uncertain ports, web modes, public paths, and health paths with their matching overrides.
 - Add cron services manually when the schedule cannot be inferred safely.
@@ -62,6 +62,7 @@ python3 "$DISCO_SETUP_SKILL/scripts/infer_disco.py" \
   --repo "$PWD" \
   --app-path apps/web \
   --dockerfile apps/web/Dockerfile \
+  --context apps/web \
   --port 8080 \
   --dry-run
 ```

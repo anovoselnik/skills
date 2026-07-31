@@ -164,6 +164,7 @@ class DiscoAnalyzerTests(unittest.TestCase):
                 package,
                 "vite",
                 dockerfile,
+                app,
                 None,
             )
 
@@ -210,6 +211,26 @@ class DiscoAnalyzerTests(unittest.TestCase):
 
             self.assertTrue(blockers)
 
+    def test_runnable_workspace_root_with_nested_app_is_a_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_json(
+                root / "package.json",
+                {
+                    "workspaces": ["apps/*"],
+                    "scripts": {"start": "node root.js"},
+                },
+            )
+            self.write_json(
+                root / "apps" / "web" / "package.json",
+                {"dependencies": {"next": "latest"}, "scripts": {"start": "next start"}},
+            )
+
+            _, _, _, blockers = infer_disco.resolve_app_root(root, None)
+
+            self.assertTrue(blockers)
+            self.assertIn("workspace root", blockers[0])
+
     def test_prebuilt_image_allows_dockerfile_free_app(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -230,6 +251,74 @@ class DiscoAnalyzerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("requires --image", result.stdout)
 
+    def test_base_image_build_includes_application_start_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_json(root / "package.json", {"scripts": {"start": "node server.js"}})
+
+            result = self.run_cli(
+                root,
+                "--image",
+                "node:22",
+                "--build-command",
+                "npm ci",
+                "--port",
+                "3000",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            web = json.loads((root / "disco.json").read_text())["services"]["web"]
+            self.assertEqual(web["build"], "npm ci")
+            self.assertEqual(web["command"], "npm run start")
+
+    def test_nonroot_dockerfile_requires_explicit_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "apps" / "web"
+            app.mkdir(parents=True)
+            (app / "Dockerfile").write_text("FROM node:22\nEXPOSE 3000\n", encoding="utf-8")
+            self.write_json(app / "package.json", {"scripts": {"start": "node server.js"}})
+
+            blocked = self.run_cli(root, "--app-path", "apps/web")
+            successful = self.run_cli(
+                root,
+                "--app-path",
+                "apps/web",
+                "--context",
+                "apps/web",
+            )
+
+            self.assertEqual(blocked.returncode, 2)
+            self.assertIn("explicit build context", blocked.stdout)
+            self.assertEqual(successful.returncode, 0, successful.stdout + successful.stderr)
+            config = json.loads((root / "disco.json").read_text())
+            self.assertEqual(config["images"]["app"]["context"], "apps/web")
+
+    def test_explicit_image_overrides_all_preserved_runtime_services(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_json(
+                root / "package.json",
+                {"scripts": {"start": "node server.js", "worker": "node worker.js"}},
+            )
+            self.write_json(
+                root / "disco.json",
+                {
+                    "version": "1.0",
+                    "services": {
+                        "web": {"port": 3000, "image": "old/web:latest"},
+                        "worker": {"command": "node worker.js", "image": "old/worker:latest"},
+                    },
+                },
+            )
+
+            result = self.run_cli(root, "--image", "node:22")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            services = json.loads((root / "disco.json").read_text())["services"]
+            self.assertEqual(services["web"]["image"], "node:22")
+            self.assertEqual(services["worker"]["image"], "node:22")
+
     def test_blocker_prevents_output_but_writes_requested_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -249,7 +338,113 @@ class DiscoAnalyzerTests(unittest.TestCase):
             "npm",
         )
 
-        self.assertIsNone(commands[0][2])
+        self.assertIsNone(commands[0].schedule)
+
+    def test_unscheduled_cron_blocks_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_node_app(root)
+            self.write_json(
+                root / "package.json",
+                {
+                    "scripts": {
+                        "start": "node server.js",
+                        "cron:cleanup": "node cleanup.js",
+                    }
+                },
+            )
+
+            result = self.run_cli(root)
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("needs an explicit cron service", result.stdout)
+            self.assertFalse((root / "disco.json").exists())
+
+    def test_static_site_cli_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "public").mkdir()
+            (root / "public" / "index.html").write_text("hello", encoding="utf-8")
+
+            result = self.run_cli(root)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            web = json.loads((root / "disco.json").read_text())["services"]["web"]
+            self.assertEqual(web, {"type": "static", "publicPath": "public"})
+
+    def test_worker_migration_and_cron_cli_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_node_app(root)
+            self.write_json(
+                root / "package.json",
+                {
+                    "scripts": {
+                        "start": "node server.js",
+                        "worker": "node worker.js",
+                        "db:migrate": "prisma migrate deploy",
+                        "cron:daily": "node cleanup.js",
+                    }
+                },
+            )
+
+            result = self.run_cli(root)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            services = json.loads((root / "disco.json").read_text())["services"]
+            self.assertIn("worker", services)
+            self.assertIn("hook:deploy:start:before", services)
+            self.assertEqual(services["cron-daily"]["schedule"], "0 0 * * *")
+
+    def test_python_cli_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Dockerfile").write_text("FROM python:3.13\nEXPOSE 8000\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                '[project]\ndependencies = ["fastapi>=0.100"]\n',
+                encoding="utf-8",
+            )
+
+            result = self.run_cli(root)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            web = json.loads((root / "disco.json").read_text())["services"]["web"]
+            self.assertEqual(web["port"], 8000)
+
+    def test_nested_service_schema_is_validated(self) -> None:
+        config = {
+            "version": "1.0",
+            "services": {
+                "web": {
+                    "port": 8000,
+                    "image": "example/app:latest",
+                    "volumes": [{"name": 123, "destinationPath": None}],
+                    "publishedPorts": [
+                        {"publishedAs": 70000, "fromContainerPort": "8000", "protocol": "icmp"}
+                    ],
+                    "health": {"command": 123},
+                    "timeout": 0,
+                    "exposedInternally": "yes",
+                    "extraSwarmParams": [],
+                }
+            },
+        }
+
+        _, blockers = infer_disco.validate_disco_config(config, Path("/repo"))
+        rendered = "\n".join(blockers)
+
+        for field in (
+            "volumes[0].name",
+            "volumes[0].destinationPath",
+            "publishedPorts[0].publishedAs",
+            "publishedPorts[0].fromContainerPort",
+            "publishedPorts[0].protocol",
+            "health",
+            "timeout",
+            "exposedInternally",
+            "extraSwarmParams",
+        ):
+            self.assertIn(field, rendered)
 
     def test_sensitive_fields_are_blockers_and_are_redacted_in_reports(self) -> None:
         config = {
