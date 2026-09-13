@@ -28,6 +28,8 @@ workflow. Supporting directories are included only when the skill needs them.
 - `comment-triage` — assess GitHub review comments before implementation.
 - `disco-setup` — infer and safely maintain a Disco deployment configuration.
 - `file-pr` — publish a concise, review-ready pull request.
+- `implement` — implement, test, review, and commit a defined task.
+- `shipmate` — implement work, open its pull request, and babysit it through review and CI.
 - `tune-agent-instructions` — improve agent instructions from observed behavior.
 
 ## Using a skill
@@ -40,3 +42,16 @@ git clone git@github.com:anovoselnik/skills.git
 ```
 
 Consult the skill's `SKILL.md` for any setup requirements or usage notes.
+
+### Shipmate
+
+Install `shipmate`, `implement`, and `file-pr` together. Install `babysit-pr` to
+include monitoring; without it, Shipmate finishes after publishing the PR and
+reports that monitoring was unavailable. The implementation stage also reuses
+`tdd` and `code-review` when those skills are available in your agent's environment.
+
+For example, ask your agent to "Shipmate issue #123" or, in Codex, invoke
+`$shipmate` with the task. It carries the work through implementation, verification,
+review, PR creation, and available babysitting. Its default endpoint is a PR ready
+for a human merge decision. Explicit instructions such as "keep it local" or
+"skip monitoring" shorten the workflow.
