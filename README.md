@@ -28,6 +28,7 @@ workflow. Supporting directories are included only when the skill needs them.
 - `comment-triage` — assess GitHub review comments before implementation.
 - `disco-setup` — infer and safely maintain a Disco deployment configuration.
 - `file-pr` — publish a concise, review-ready pull request.
+- `grind` — ship an issue queue through fresh Shipmate agents, merging and completing one ticket at a time.
 - `implement` — implement, test, review, and commit a defined task.
 - `shipmate` — implement work, open its pull request, and babysit it through review and CI.
 - `tune-agent-instructions` — improve agent instructions from observed behavior.
@@ -55,3 +56,20 @@ For example, ask your agent to "Shipmate issue #123" or, in Codex, invoke
 review, PR creation, and available babysitting. Its default endpoint is a PR ready
 for a human merge decision. Explicit instructions such as "keep it local" or
 "skip monitoring" shorten the workflow.
+
+### Grind
+
+Install `grind`, `shipmate`, `implement`, `file-pr`, and `babysit-pr` together.
+Grind requires a host that can start subagents without inheriting the parent's
+conversation history. It processes an ordered issue list or inclusive range:
+
+```text
+$grind #64–#75 in owner/repo
+```
+
+Each issue gets a fresh Shipmate agent and a dedicated worktree. The parent
+verifies merge readiness, merges the PR, and confirms the issue is completed
+before starting the next ticket from the updated base. Running Grind authorizes
+those merges and issue updates; explicit limits such as "plan only" or "do not
+merge" take precedence. A blocked issue pauses the queue with a local progress
+record for resumption.
