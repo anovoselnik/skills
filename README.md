@@ -61,7 +61,8 @@ for a human merge decision. Explicit instructions such as "keep it local" or
 
 Install `grind`, `shipmate`, `implement`, `file-pr`, and `babysit-pr` together.
 Grind requires a host that can start subagents without inheriting the parent's
-conversation history. It processes an ordered issue list or inclusive range:
+conversation history. Automatic selection is disabled; invoke `$grind` explicitly
+with an ordered issue list or inclusive range:
 
 ```text
 $grind #64–#75 in owner/repo

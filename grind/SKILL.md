@@ -1,6 +1,6 @@
 ---
 name: grind
-description: Ships an ordered queue of GitHub issues through fresh Shipmate subagents, merging each PR and completing its issue before starting the next. Use when the user invokes grind or asks to implement and merge a batch of tickets one by one.
+description: Ships an ordered queue of GitHub issues through fresh Shipmate subagents, merging each PR and completing its issue before starting the next. Invoke explicitly with $grind.
 ---
 
 # Grind

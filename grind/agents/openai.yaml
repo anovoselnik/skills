@@ -3,4 +3,4 @@ interface:
   short_description: "Ship and merge an issue queue, one ticket at a time"
   default_prompt: "Use $grind to ship these issues one by one through fresh Shipmate subagents, merging each ready PR and marking its issue complete before starting the next."
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false
