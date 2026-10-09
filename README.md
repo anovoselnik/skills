@@ -30,6 +30,7 @@ workflow. Supporting directories are included only when the skill needs them.
 - `file-pr` — publish a concise, review-ready pull request.
 - `grind` — ship an issue queue through fresh Shipmate agents, merging and completing one ticket at a time.
 - `implement` — implement, test, review, and commit a defined task.
+- `prune-worktrees` - find local git worktrees whose work is merged and remove them.
 - `shipmate` — implement work, open its pull request, and babysit it through review and CI.
 - `tune-agent-instructions` — improve agent instructions from observed behavior.
 
