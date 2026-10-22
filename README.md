@@ -33,6 +33,7 @@ workflow. Supporting directories are included only when the skill needs them.
 - `kickoff-next-ticket` — pick the next ready GitHub or GitLab issue, claim it, and start it with Shipmate.
 - `prune-worktrees` - find local git worktrees whose work is merged and remove them.
 - `shipmate` — implement work, open its pull request, and babysit it through review and CI.
+- `test-inbox` — give the agent disposable testmail.app inboxes for email flows.
 - `tune-agent-instructions` — improve agent instructions from observed behavior.
 
 ## Using a skill
