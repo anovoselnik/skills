@@ -30,6 +30,7 @@ workflow. Supporting directories are included only when the skill needs them.
 - `file-pr` — publish a concise, review-ready pull request.
 - `grind` — ship an issue queue through fresh Shipmate agents, merging and completing one ticket at a time.
 - `implement` — implement, test, review, and commit a defined task.
+- `kickoff-next-ticket` — pick the next ready GitHub or GitLab issue, claim it, and start it with Shipmate.
 - `prune-worktrees` - find local git worktrees whose work is merged and remove them.
 - `shipmate` — implement work, open its pull request, and babysit it through review and CI.
 - `tune-agent-instructions` — improve agent instructions from observed behavior.
@@ -75,3 +76,21 @@ before starting the next ticket from the updated base. Running Grind authorizes
 those merges and issue updates; explicit limits such as "plan only" or "do not
 merge" take precedence. A blocked issue pauses the queue with a local progress
 record for resumption.
+
+### Kickoff Next Ticket
+
+Install `kickoff-next-ticket` alongside the Shipmate skills. Invoke it explicitly
+from a repository checkout:
+
+```text
+$kickoff-next-ticket
+$kickoff-next-ticket next bug in milestone v2
+$kickoff-next-ticket dry run
+```
+
+It reads the `origin` remote to choose `gh` or `glab` and lists open issues. It
+skips any issue that is assigned to someone else, already has an open PR or MR,
+carries a blocking label, or depends on an open issue. The remaining issues are
+ranked by your assignment, then the repository's priority signal, then age. It
+assigns the chosen issue to you and runs Shipmate on it. On GitLab, Shipmate
+opens a merge request but `babysit-pr` monitoring does not run.

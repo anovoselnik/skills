@@ -1,0 +1,6 @@
+interface:
+  display_name: "Kickoff Next Ticket"
+  short_description: "Pick the next ready issue and start it with Shipmate"
+  default_prompt: "Use $kickoff-next-ticket to pick the next ready issue in this repository, claim it, and start it through Shipmate."
+policy:
+  allow_implicit_invocation: false
